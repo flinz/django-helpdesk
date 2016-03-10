@@ -11,6 +11,7 @@ from django.utils.encoding import python_2_unicode_compatible
 from datetime import datetime, timedelta
 import sys
 
+from django import VERSION
 from django.conf import settings
 try:
     from django.contrib.auth import get_user_model
@@ -20,11 +21,11 @@ except ImportError:
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.core.files.base import ContentFile
 from django.core.urlresolvers import reverse
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, PermissionDenied
 from django.core import paginator
 from django.db import connection
 from django.db.models import Q
-from django.http import HttpResponseRedirect, Http404, HttpResponse, HttpResponseForbidden
+from django.http import HttpResponseRedirect, Http404, HttpResponse
 from django.shortcuts import render_to_response, get_object_or_404
 from django.template import loader, Context, RequestContext
 from django.utils.dates import MONTHS_3
@@ -52,6 +53,34 @@ else:
 superuser_required = user_passes_test(lambda u: u.is_authenticated() and u.is_active and u.is_superuser)
 
 
+def _get_user_queues(user):
+    """Return the list of Queues the user can access.
+
+    :param user: The User (the class should have the has_perm method)
+    :return: A Python list of Queues
+    """
+    all_queues = Queue.objects.all()
+    limit_queues_by_user = helpdesk_settings.HELPDESK_ENABLE_PER_QUEUE_STAFF_PERMISSION and not user.is_superuser
+    if limit_queues_by_user:
+        id_list = [q.pk for q in all_queues if user.has_perm(q.permission_name)]
+        return all_queues.filter(pk__in=id_list)
+    else:
+        return all_queues
+
+
+def _has_access_to_queue(user, queue):
+    """Check if a certain user can access a certain queue.
+
+    :param user: The User (the class should have the has_perm method)
+    :param queue: The django-helpdesk Queue instance
+    :return: True if the user has permission (either by default or explicitly), false otherwise
+    """
+    if user.is_superuser or not helpdesk_settings.HELPDESK_ENABLE_PER_QUEUE_STAFF_PERMISSION:
+        return True
+    else:
+        return user.has_perm(queue.permission_name)
+
+
 def dashboard(request):
     """
     A quick summary overview for users: A list of their own tickets, a table
@@ -71,8 +100,11 @@ def dashboard(request):
             assigned_to=request.user,
             status__in = [Ticket.CLOSED_STATUS, Ticket.RESOLVED_STATUS])
 
+    user_queues = _get_user_queues(request.user)
+
     unassigned_tickets = Ticket.objects.select_related('queue').filter(
             assigned_to__isnull=True,
+            queue__in=user_queues
         ).exclude(
             status=Ticket.CLOSED_STATUS,
         )
@@ -85,13 +117,26 @@ def dashboard(request):
             submitter_email=email_current_user,
         ).order_by('status')
 
-    basic_ticket_stats = calc_basic_ticket_stats(Ticket)
+    Tickets = Ticket.objects.filter(
+                queue__in=user_queues,
+            )
+    basic_ticket_stats = calc_basic_ticket_stats(Tickets)
 
     # The following query builds a grid of queues & ticket statuses,
     # to be displayed to the user. EG:
     #          Open  Resolved
     # Queue 1    10     4
     # Queue 2     4    12
+
+    queues = _get_user_queues(request.user).values_list('id', flat=True)
+
+    from_clause = """FROM    helpdesk_ticket t,
+                    helpdesk_queue q"""
+    if queues:
+        where_clause = """WHERE   q.id = t.queue_id AND
+                        q.id IN (%s)""" % (",".join(("%d" % pk for pk in queues)))
+    else:
+        where_clause = """WHERE   q.id = t.queue_id"""
 
     cursor = connection.cursor()
     cursor.execute("""
@@ -100,12 +145,11 @@ def dashboard(request):
                     COUNT(CASE t.status WHEN '1' THEN t.id WHEN '2' THEN t.id END) AS open,
                     COUNT(CASE t.status WHEN '3' THEN t.id END) AS resolved,
                     COUNT(CASE t.status WHEN '4' THEN t.id END) AS closed
-            FROM    helpdesk_ticket t,
-                    helpdesk_queue q
-            WHERE   q.id = t.queue_id
+            %s
+            %s
             GROUP BY queue, name
             ORDER BY q.id;
-    """)
+    """ % (from_clause, where_clause))
 
     dash_tickets = query_to_dict(cursor.fetchall(), cursor.description)
 
@@ -123,6 +167,8 @@ dashboard = staff_member_required(dashboard)
 
 def delete_ticket(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
 
     if request.method == 'GET':
         return render_to_response('helpdesk/delete_ticket.html',
@@ -138,6 +184,8 @@ def followup_edit(request, ticket_id, followup_id):
     "Edit followup options with an ability to change the ticket."
     followup = get_object_or_404(FollowUp, id=followup_id)
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
     if request.method == 'GET':
         form = EditFollowUpForm(initial=
                                      {'title': escape(followup.title),
@@ -196,6 +244,8 @@ followup_delete = staff_member_required(followup_delete)
 
 def view_ticket(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
 
     if 'take' in request.GET:
         # Allow the user to assign the ticket to themselves whilst viewing it.
@@ -347,11 +397,19 @@ def update_ticket(request, ticket_id, public=False):
     # if comment contains some django code, like "why does {% if bla %} crash",
     # then the following line will give us a crash, since django expects {% if %}
     # to be closed with an {% endif %} tag.
-    
 
     # get_template_from_string was removed in Django 1.8 http://django.readthedocs.org/en/1.8.x/ref/templates/upgrading.html
-    from django.template import engines
-    comment = engines['django'].from_string(comment).render(Context(context))
+    try:
+        from django.template import engines
+        template_func = engines['django'].from_string
+    except ImportError:  # occurs in django < 1.8
+        template_func = loader.get_template_from_string
+
+    # RemovedInDjango110Warning: render() must be called with a dict, not a Context.
+    if VERSION < (1, 8):
+        context = Context(context)
+
+    comment = template_func(comment).render(context)
 
     if owner is -1 and ticket.assigned_to:
         owner = ticket.assigned_to.id
@@ -492,6 +550,7 @@ def update_ticket(request, ticket_id, public=False):
                     recipients=cc.email_address,
                     sender=ticket.queue.from_address,
                     fail_silently=True,
+                    files=files,
                     )
                 messages_sent_to.append(cc.email_address)
 
@@ -573,6 +632,9 @@ def mass_update(request):
         action = 'assign'
 
     for t in Ticket.objects.filter(id__in=tickets):
+        if not _has_access_to_queue(request.user, t.queue):
+            continue
+
         if action == 'assign' and t.assigned_to != user:
             t.assigned_to = user
             t.save()
@@ -651,6 +713,10 @@ mass_update = staff_member_required(mass_update)
 def ticket_list(request):
     context = {}
 
+    user_queues = _get_user_queues(request.user)
+    # Prefilter the allowed tickets
+    base_tickets = Ticket.objects.filter(queue__in=user_queues)
+
     # Query_params will hold a dictionary of parameters relating to
     # a query, to be saved if needed:
     query_params = {
@@ -691,7 +757,7 @@ def ticket_list(request):
 
         if filter:
             try:
-                ticket = Ticket.objects.get(**filter)
+                ticket = base_tickets.get(**filter)
                 return HttpResponseRedirect(ticket.staff_url)
             except Ticket.DoesNotExist:
                 # Go on to standard keyword searching
@@ -785,15 +851,17 @@ def ticket_list(request):
         sortreverse = request.GET.get('sortreverse', None)
         query_params['sortreverse'] = sortreverse
 
+    tickets = base_tickets.select_related()
+
     try:
-        ticket_qs = apply_query(Ticket.objects.select_related(), query_params)
+        ticket_qs = apply_query(tickets, query_params)
     except ValidationError:
         # invalid parameters in query, return default query
         query_params = {
             'filtering': {'status__in': [1, 2, 3]},
             'sorting': 'created',
         }
-        ticket_qs = apply_query(Ticket.objects.select_related(), query_params)
+        ticket_qs = apply_query(tickets, query_params)
 
     ticket_paginator = paginator.Paginator(ticket_qs, request.user.usersettings.settings.get('tickets_per_page') or 20)
     try:
@@ -830,7 +898,7 @@ def ticket_list(request):
             query_string=querydict.urlencode(),
             tickets=tickets,
             user_choices=User.objects.filter(is_active=True,is_staff=True),
-            queue_choices=Queue.objects.all(),
+            queue_choices=user_queues,
             status_choices=Ticket.STATUS_CHOICES,
             urlsafe_query=urlsafe_query,
             user_saved_queries=user_saved_queries,
@@ -844,6 +912,9 @@ ticket_list = staff_member_required(ticket_list)
 
 def edit_ticket(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
+
     if request.method == 'POST':
         form = EditTicketForm(request.POST, instance=ticket)
         if form.is_valid():
@@ -870,7 +941,10 @@ def create_ticket(request):
         form.fields['assigned_to'].choices = [('', '--------')] + [[u.id, u.get_username()] for u in assignable_users]
         if form.is_valid():
             ticket = form.save(user=request.user)
-            return HttpResponseRedirect(ticket.get_absolute_url())
+            if _has_access_to_queue(request.user, ticket.queue):
+                return HttpResponseRedirect(ticket.get_absolute_url())
+            else:
+                return HttpResponseRedirect(reverse('helpdesk_dashboard'))
     else:
         initial_data = {}
         if request.user.usersettings.settings.get('use_email_as_submitter', False) and request.user.email:
@@ -912,6 +986,8 @@ raw_details = staff_member_required(raw_details)
 
 def hold_ticket(request, ticket_id, unhold=False):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
 
     if unhold:
         ticket.on_hold = False
@@ -963,7 +1039,9 @@ def run_report(request, report):
     if Ticket.objects.all().count() == 0 or report not in ('queuemonth', 'usermonth', 'queuestatus', 'queuepriority', 'userstatus', 'userpriority', 'userqueue', 'daysuntilticketclosedbymonth'):
         return HttpResponseRedirect(reverse("helpdesk_report_index"))
 
-    report_queryset = Ticket.objects.all().select_related()
+    report_queryset = Ticket.objects.all().select_related().filter(
+        queue__in=_get_user_queues(request.user)
+    )
 
     from_saved_query = False
     saved_query = None
@@ -1023,7 +1101,8 @@ def run_report(request, report):
     elif report == 'userqueue':
         title = _('User by Queue')
         col1heading = _('User')
-        possible_options = [q.title.encode('utf-8') for q in Queue.objects.all()]
+        queue_options = _get_user_queues(request.user)
+        possible_options = [q.title for q in queue_options]
         charttype = 'bar'
 
     elif report == 'userstatus':
@@ -1098,12 +1177,10 @@ def run_report(request, report):
             metric3 = ticket.modified - ticket.created
             metric3 = metric3.days
 
-
         summarytable[metric1, metric2] += 1
         if metric3:
             if report == 'daysuntilticketclosedbymonth':
                 summarytable2[metric1, metric2] += metric3
-
 
     table = []
 
@@ -1111,7 +1188,7 @@ def run_report(request, report):
         for key in summarytable2.keys():
             summarytable[key] = summarytable2[key] / summarytable[key]
 
-    header1 = sorted(set(list( i.encode('utf-8') for i,_ in summarytable.keys() )))
+    header1 = sorted(set(list(i for i, _ in summarytable.keys())))
 
     column_headings = [col1heading] + possible_options
 
@@ -1219,6 +1296,9 @@ email_ignore_del = superuser_required(email_ignore_del)
 
 def ticket_cc(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
+
     copies_to = ticket.ticketcc_set.all()
     return render_to_response('helpdesk/ticket_cc_list.html',
         RequestContext(request, {
@@ -1229,6 +1309,9 @@ ticket_cc = staff_member_required(ticket_cc)
 
 def ticket_cc_add(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
+
     if request.method == 'POST':
         form = TicketCCForm(request.POST)
         if form.is_valid():
@@ -1247,6 +1330,7 @@ ticket_cc_add = staff_member_required(ticket_cc_add)
 
 def ticket_cc_del(request, ticket_id, cc_id):
     cc = get_object_or_404(TicketCC, ticket__id=ticket_id, id=cc_id)
+
     if request.method == 'POST':
         cc.delete()
         return HttpResponseRedirect(reverse('helpdesk_ticket_cc', kwargs={'ticket_id': cc.ticket.id}))
@@ -1258,6 +1342,8 @@ ticket_cc_del = staff_member_required(ticket_cc_del)
 
 def ticket_dependency_add(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
     if request.method == 'POST':
         form = TicketDependencyForm(request.POST)
         if form.is_valid():
@@ -1288,6 +1374,8 @@ ticket_dependency_del = staff_member_required(ticket_dependency_del)
 
 def attachment_del(request, ticket_id, attachment_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not _has_access_to_queue(request.user, ticket.queue):
+        raise PermissionDenied()
     attachment = get_object_or_404(Attachment, id=attachment_id)
     attachment.delete()
     return HttpResponseRedirect(reverse('helpdesk_view', args=[ticket_id]))
@@ -1311,9 +1399,9 @@ def calc_average_nbr_days_until_ticket_resolved(Tickets):
 
     return mean_per_ticket
 
-def calc_basic_ticket_stats(Ticket):
+def calc_basic_ticket_stats(Tickets):
     # all not closed tickets (open, reopened, resolved,) - independent of user
-    all_open_tickets = Ticket.objects.exclude(status = Ticket.CLOSED_STATUS)
+    all_open_tickets = Tickets.exclude(status = Ticket.CLOSED_STATUS)
     today = datetime.today()
 
     date_30 = date_rel_to_today(today, 30)
@@ -1341,7 +1429,7 @@ def calc_basic_ticket_stats(Ticket):
     ots.append(['> 60 days', N_ota_ge_60, get_color_for_nbr_days(N_ota_ge_60), sort_string('', date_60_str), ])
 
     # all closed tickets - independent of user.
-    all_closed_tickets = Ticket.objects.filter(status = Ticket.CLOSED_STATUS)
+    all_closed_tickets = Tickets.filter(status = Ticket.CLOSED_STATUS)
     average_nbr_days_until_ticket_closed = calc_average_nbr_days_until_ticket_resolved(all_closed_tickets)
     # all closed tickets that were opened in the last 60 days.
     all_closed_last_60_days = all_closed_tickets.filter(created__gte = date_60_str)
