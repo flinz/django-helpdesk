@@ -24,8 +24,8 @@ install:
     - pip install -q -r requirements.txt
 
 script: 
-    coverage run --source='.' quicktest.py helpdesk
+    - coverage run --source='.' quicktest.py helpdesk
 
 after-success:
-    coveralls debug
-    coveralls
+    - coveralls debug
+    - coveralls
