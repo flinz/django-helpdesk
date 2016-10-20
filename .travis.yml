@@ -26,5 +26,5 @@ install:
 script: 
     - coverage run --source='.' quicktest.py helpdesk
 
-after-success:
+after_success:
     - codecov
