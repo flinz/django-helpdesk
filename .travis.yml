@@ -27,4 +27,5 @@ script:
     coverage run --source='.' quicktest.py helpdesk
 
 after-success:
+    coveralls debug
     coveralls
