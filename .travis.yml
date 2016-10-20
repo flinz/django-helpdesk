@@ -19,7 +19,7 @@ matrix:
 install:
     - pip install argparse
     - pip install coverage
-    - pip install coveralls
+    - pip install codecov
     - pip install -q Django==$DJANGO
     - pip install -q -r requirements.txt
 
@@ -27,5 +27,4 @@ script:
     - coverage run --source='.' quicktest.py helpdesk
 
 after-success:
-    - coveralls debug
-    - coveralls
+    - codecov
