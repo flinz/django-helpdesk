@@ -75,12 +75,44 @@ class PerQueueStaffMembershipTestCase(TestCase):
         # Regular users
         for identifier in self.IDENTIFIERS:
             self.client.login(username='User_%d' % identifier, password=str(identifier))
-            response = self.client.get(reverse('helpdesk_dashboard'))
+            response = self.client.get(reverse('helpdesk:dashboard'))
             self.assertEqual(
                 len(response.context['unassigned_tickets']),
                 identifier,
                 'Unassigned tickets were not properly limited by queue membership'
             )
+            self.assertEqual(
+                response.context['basic_ticket_stats']['open_ticket_stats'][0][1],
+                identifier * 2,
+                'Basic ticket stats were not properly limited by queue membership'
+            )
+
+        # Superuser
+        self.client.login(username='superuser', password='superuser')
+        response = self.client.get(reverse('helpdesk:dashboard'))
+        self.assertEqual(
+            len(response.context['unassigned_tickets']),
+            3,
+            'Unassigned tickets were limited by queue membership for a superuser'
+        )
+        self.assertEqual(
+            response.context['basic_ticket_stats']['open_ticket_stats'][0][1] +
+            response.context['basic_ticket_stats']['open_ticket_stats'][1][1],
+            6,
+            'Basic ticket stats were limited by queue membership for a superuser'
+        )
+
+    def test_report_ticket_counts(self):
+        """
+        Check that the regular users' report only shows 1 of the 2 queues,
+        that user_1 only sees a total of 1 ticket, that user_2 sees a total of 2
+        tickets, but that the superuser's report shows all queues and tickets.
+        """
+
+        # Regular users
+        for identifier in self.IDENTIFIERS:
+            self.client.login(username='User_%d' % identifier, password=str(identifier))
+            response = self.client.get(reverse('helpdesk:report_index'))
             self.assertEqual(
                 len(response.context['dash_tickets']),
                 1,
@@ -99,12 +131,7 @@ class PerQueueStaffMembershipTestCase(TestCase):
 
         # Superuser
         self.client.login(username='superuser', password='superuser')
-        response = self.client.get(reverse('helpdesk_dashboard'))
-        self.assertEqual(
-            len(response.context['unassigned_tickets']),
-            3,
-            'Unassigned tickets were limited by queue membership for a superuser'
-        )
+        response = self.client.get(reverse('helpdesk:report_index'))
         self.assertEqual(
             len(response.context['dash_tickets']),
             2,
@@ -132,7 +159,7 @@ class PerQueueStaffMembershipTestCase(TestCase):
         # Regular users
         for identifier in self.IDENTIFIERS:
             self.client.login(username='User_%d' % identifier, password=str(identifier))
-            response = self.client.get(reverse('helpdesk_list'))
+            response = self.client.get(reverse('helpdesk:list'))
             self.assertEqual(
                 len(response.context['tickets']),
                 identifier * 2,
@@ -151,7 +178,7 @@ class PerQueueStaffMembershipTestCase(TestCase):
 
         # Superuser
         self.client.login(username='superuser', password='superuser')
-        response = self.client.get(reverse('helpdesk_list'))
+        response = self.client.get(reverse('helpdesk:list'))
         self.assertEqual(
             len(response.context['tickets']),
             6,
@@ -168,7 +195,7 @@ class PerQueueStaffMembershipTestCase(TestCase):
         for identifier in self.IDENTIFIERS:
             self.client.login(username='User_%d' % identifier, password=str(identifier))
             response = self.client.get(
-                reverse('helpdesk_run_report', kwargs={'report': 'userqueue'})
+                reverse('helpdesk:run_report', kwargs={'report': 'userqueue'})
             )
             # Only two columns of data should be present: ticket counts for
             # unassigned and this user only
@@ -199,7 +226,7 @@ class PerQueueStaffMembershipTestCase(TestCase):
         # Superuser
         self.client.login(username='superuser', password='superuser')
         response = self.client.get(
-            reverse('helpdesk_run_report', kwargs={'report': 'userqueue'})
+            reverse('helpdesk:run_report', kwargs={'report': 'userqueue'})
         )
         # Superuser should see ticket counts for all two queues, which includes
         # three columns: unassigned and both user 1 and user 2
