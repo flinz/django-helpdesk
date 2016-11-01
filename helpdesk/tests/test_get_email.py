@@ -11,13 +11,12 @@ try:  # python 3
 except ImportError:  # python 2
     from urlparse import urlparse
 
-# bugfix for python 3.4 issue: http://bugs.python.org/issue21750
-# import the external mock instead, if existing
 try:
-    import mock
+    # Python >= 3.3
+    from unittest import mock
 except ImportError:
     # Python < 3.3
-    from unittest import mock
+    import mock
 
 
 class GetEmailCommonTests(TestCase):
@@ -41,7 +40,7 @@ class GetEmailParametricTemplate(object):
             "slug": 'QQ',
             "allow_public_submission": True,
             "allow_email_submission": True,
-            "email_box_type": self.method,}
+            "email_box_type": self.method}
 
         if self.method == 'local':
             kwargs["email_box_local_dir"] = '/var/lib/mail/helpdesk/'
