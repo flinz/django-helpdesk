@@ -98,7 +98,6 @@ class GetEmailParametricTemplate(object):
                 with self.assertRaisesRegexp(errorclass, "Connection refused"):
                     call_command('get_email')
 
-
             # Other methods go here, not implemented yet.
             else:
                 return True
