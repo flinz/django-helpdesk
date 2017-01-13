@@ -9,7 +9,6 @@ views/staff.py - The bulk of the application - provides most business logic and
 from __future__ import unicode_literals
 from datetime import datetime, timedelta
 
-from django import VERSION
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import user_passes_test
@@ -24,11 +23,7 @@ from django.utils.dates import MONTHS_3
 from django.utils.translation import ugettext as _
 from django.utils.html import escape
 from django import forms
-
-try:
-    from django.utils import timezone
-except ImportError:
-    from datetime import datetime as timezone
+from django.utils import timezone
 
 from helpdesk.forms import (
     TicketForm, UserSettingsForm, EmailIgnoreForm, EditTicketForm, TicketCCForm,
@@ -36,6 +31,7 @@ from helpdesk.forms import (
 )
 from helpdesk.lib import (
     send_templated_mail, query_to_dict, apply_query, safe_template_context,
+    process_attachments,
 )
 from helpdesk.models import (
     Ticket, Queue, FollowUp, TicketChange, PreSetReply, Attachment, SavedSearch,
@@ -407,25 +403,14 @@ def update_ticket(request, ticket_id, public=False):
 
     # We need to allow the 'ticket' and 'queue' contexts to be applied to the
     # comment.
-    from django.template import loader, Context
     context = safe_template_context(ticket)
+
     # this line sometimes creates problems if code is sent as a comment.
     # if comment contains some django code, like "why does {% if bla %} crash",
     # then the following line will give us a crash, since django expects {% if %}
     # to be closed with an {% endif %} tag.
-
-    # get_template_from_string was removed in Django 1.8
-    # http://django.readthedocs.org/en/1.8.x/ref/templates/upgrading.html
-    try:
-        from django.template import engines
-        template_func = engines['django'].from_string
-    except ImportError:  # occurs in django < 1.8
-        template_func = loader.get_template_from_string
-
-    # RemovedInDjango110Warning: render() must be called with a dict, not a Context.
-    if VERSION < (1, 8):
-        context = Context(context)
-
+    from django.template import engines
+    template_func = engines['django'].from_string
     comment = template_func(comment).render(context)
 
     if owner is -1 and ticket.assigned_to:
@@ -474,28 +459,9 @@ def update_ticket(request, ticket_id, public=False):
 
     f.save()
 
-    files = []
-    if request.FILES:
-        import mimetypes
-        for file in request.FILES.getlist('attachment'):
-            filename = file.name.encode('ascii', 'ignore')
-            filename = filename.decode("utf-8")
-            print(filename)
-            a = Attachment(
-                followup=f,
-                filename=filename,
-                mime_type=file.content_type or 'application/octet-stream',
-                size=file.size,
-            )
-            a.file.save(filename, file, save=False)
-            a.save()
+    files = process_attachments(f, request.FILES.getlist('attachment'))
 
-            if file.size < getattr(settings, 'MAX_EMAIL_ATTACHMENT_SIZE', 512000):
-                # Only files smaller than 512kb (or as defined in
-                # settings.MAX_EMAIL_ATTACHMENT_SIZE) are sent via email.
-                files.append([a.filename, a.file])
-
-    if title != ticket.title:
+    if title and title != ticket.title:
         c = TicketChange(
             followup=f,
             field=_('Title'),
@@ -1124,7 +1090,7 @@ def run_report(request, report):
     if Ticket.objects.all().count() == 0 or report not in (
             'queuemonth', 'usermonth', 'queuestatus', 'queuepriority', 'userstatus',
             'userpriority', 'userqueue', 'daysuntilticketclosedbymonth'):
-        return HttpResponseRedirect(reverse("helpdesk_report_index"))
+        return HttpResponseRedirect(reverse("helpdesk:report_index"))
 
     report_queryset = Ticket.objects.all().select_related().filter(
         queue__in=_get_user_queues(request.user)
@@ -1475,7 +1441,7 @@ def attachment_del(request, ticket_id, attachment_id):
     attachment = get_object_or_404(Attachment, id=attachment_id)
     if request.method == 'POST':
         attachment.delete()
-        return HttpResponseRedirect(reverse('helpdesk_view', args=[ticket_id]))
+        return HttpResponseRedirect(reverse('helpdesk:view', args=[ticket_id]))
     return render(request, 'helpdesk/ticket_attachment_del.html', {
         'attachment': attachment,
         'filename': attachment.filename,

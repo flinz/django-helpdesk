@@ -6,24 +6,18 @@ django-helpdesk - A Django powered ticket tracker for small enterprise.
 forms.py - Definitions of newforms-based forms for creating and maintaining
            tickets.
 """
+
+
 from django.core.exceptions import ObjectDoesNotExist
-
-try:
-    from StringIO import StringIO
-except ImportError:
-    from io import StringIO
-
+from django.utils.six import StringIO
 from django import forms
 from django.forms import extras
 from django.conf import settings
 from django.utils.translation import ugettext_lazy as _
 from django.contrib.auth import get_user_model
-try:
-    from django.utils import timezone
-except ImportError:
-    from datetime import datetime as timezone
+from django.utils import timezone
 
-from helpdesk.lib import send_templated_mail, safe_template_context
+from helpdesk.lib import send_templated_mail, safe_template_context, process_attachments
 from helpdesk.models import (Ticket, Queue, FollowUp, Attachment, IgnoreEmail, TicketCC,
                              CustomField, TicketCustomFieldValue, TicketDependency)
 from helpdesk import settings as helpdesk_settings
@@ -234,28 +228,10 @@ class AbstractTicketForm(CustomFieldMixin, forms.Form):
         return followup
 
     def _attach_files_to_follow_up(self, followup):
-        attachments = []
-        if self.cleaned_data['attachment']:
-            import mimetypes
-            attachment = self.cleaned_data['attachment']
-            filename = attachment.name.replace(' ', '_')
-            att = Attachment(
-                followup=followup,
-                filename=filename,
-                mime_type=mimetypes.guess_type(filename)[0] or 'application/octet-stream',
-                size=attachment.size,
-            )
-            att.file.save(attachment.name, attachment, save=False)
-            att.save()
-
-            if attachment.size < getattr(settings, 'MAX_EMAIL_ATTACHMENT_SIZE', 512000):
-                # Only files smaller than 512kb (or as defined in
-                # settings.MAX_EMAIL_ATTACHMENT_SIZE) are sent via email.
-                try:
-                    attachments.append([att.filename, att.file])
-                except NotImplementedError:
-                    pass
-        return attachments
+        files = self.cleaned_data['attachment']
+        if files:
+            files = process_attachments(followup, [files])
+        return files
 
     @staticmethod
     def _send_messages(ticket, queue, followup, files, user=None):

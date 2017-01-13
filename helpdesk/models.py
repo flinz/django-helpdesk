@@ -13,13 +13,9 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _, ugettext
 from django.utils.encoding import python_2_unicode_compatible
-
-try:
-    from django.utils import timezone
-except ImportError:
-    from datetime import datetime as timezone
 
 
 @python_2_unicode_compatible
@@ -324,7 +320,7 @@ class Queue(models.Model):
 
             Permission.objects.create(
                 name=_("Permission for queue: ") + self.title,
-                content_type=ContentType.objects.get(model="queue"),
+                content_type=ContentType.objects.get_for_model(self.__class__),
                 codename=basename,
             )
 
@@ -745,7 +741,6 @@ def attachment_path(instance, filename):
     putting attachments in a folder off attachments for ticket/followup_id/.
     """
     import os
-    from django.conf import settings
     os.umask(0)
     path = 'helpdesk/attachments/%s/%s' % (instance.followup.ticket.ticket_for_url, instance.followup.id)
     att_path = os.path.join(settings.MEDIA_ROOT, path)
@@ -787,15 +782,6 @@ class Attachment(models.Model):
         _('Size'),
         help_text=_('Size of this file in bytes'),
     )
-
-    def get_upload_to(self, field_attname):
-        """ Get upload_to path specific to this item """
-        if not self.id:
-            return u''
-        return u'helpdesk/attachments/%s/%s' % (
-            self.followup.ticket.ticket_for_url,
-            self.followup.id
-        )
 
     def __str__(self):
         return '%s' % self.filename
@@ -1388,7 +1374,7 @@ class CustomField(models.Model):
     )
 
     def _choices_as_array(self):
-        from StringIO import StringIO
+        from django.utils.six import StringIO
         valuebuffer = StringIO(self.list_values)
         choices = [[item.strip(), item.strip()] for item in valuebuffer.readlines()]
         valuebuffer.close()
